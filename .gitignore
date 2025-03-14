@@ -1,0 +1,7 @@
+# Ignore Visual Studio cache
+.vs/
+*.user
+*.suo
+*.csproj.user
+bin/
+obj/
