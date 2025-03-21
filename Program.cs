@@ -1,66 +1,46 @@
-﻿using System.Data.SqlTypes;
-using System.Drawing;
-using System.IO;
-using System.Text;
-using System.Xml.Linq;
+﻿
 namespace File_System
 {
-    public class BlockNode
+
+    public enum ContainerElementTypeEnum
     {
-        public byte[] Content;
-        public BlockNode Next;
-    }
-    public class FileBocksLinkedList
-    {
-        public BlockNode FirstBlockNode;
-        public void Append(byte[] content)
-        {
-            BlockNode newNode = new BlockNode();
-            newNode.Content = content;
-            if (FirstBlockNode == null)
-                FirstBlockNode = newNode;
-            else
-            {
-                BlockNode current = FirstBlockNode;
-                BlockNode last = null;
-                while (current != null)
-                {
-                    last = current;
-                    current = current.Next;
-                }
-                last.Next = newNode;
-            }
-        }
-    }
-    public struct MyFile
-    {
-        public string Name;
-        public FileBocksLinkedList FileBlocks;
-        public int BlocksCount;
+        File,
+        Folder
     }
     class DirectoryNode
     {
+        public int Offset;
+        public int Size;
         public string Name;
-        public bool IsDeleted = false;
-        public int Size = 0;
-        public int NextOffset = -1;
+        public int ParentDirectoryOffset;
+        public int PreviousDirectoryInDirectoryOffset;
+        public int NextDirectoryInDirectoryOffset;
+        public int FirstDirectoryOffset;
+        public int FirstFileOffset;
     }
     class FileNode
     {
-        public MyFile Value;
-        public bool IsDeleted;
-        public int NextOffset;
+        public int Offset;
+        public int BlocksCount;
+        public string Name;
+        public int ParentDirectoryOffset;
+        public int PreviousFileInDirectoryOffset;
+        public int NextFileInDirectoryOffset;
     }
     class FileStreamFileSystem
     {
         // | DeletesCount (4B) |
-        // | NextContainerOffset (4B) | IsDeleted (1B) | ParentDirectoryOffset (4B)|
+        // | ParentDirectoryOffset (4B)|
         // if directory:
-        //      | NextDirectoryInDirectoryOffset (4B) | Size (4B) | FirstDirectoryOffset (4B) | FirstFileOffset (4B) | Name | 
+        //      | PreviousDirectoryInDirectoryOffset (4B) | NextDirectoryInDirectoryOffset (4B) | Size (4B) |
+        //      | FirstDirectoryOffset (4B) | FirstFileOffset (4B) | Name | 
         // if file:
-        //      | NextFileInDirectoryOffset (4B) | BlocksCount (4B) | Name | Data - Blocks Content |
+        //      | PreviousFileInDirectoryOffset (4B) | NextFileInDirectoryOffset (4B) | BlocksCount (4B) |
+        //      | Data - Blocks Content | Name | 
+
         public const int FILE_BLOCK_SIZE = 1024; // 1KB
         public const int DELETES_COUNT_FOR_DEFRAGMENTATION = 5;
+        uint CRC_DIVISOR = 0x04C11DB7;
 
         public int FirstOffset;
         public int CurrentDirectoryOffset;
@@ -88,9 +68,8 @@ namespace File_System
                 DeletesCount = 0;
                 _bw.Write(DeletesCount);
                 // The main directory
-                _bw.Write(-1); // NextContainerOffset
-                _bw.Write(false); // IsDeleted
                 _bw.Write(-1); // ParentDirectoryOffset
+                _bw.Write(-1); // PreviousDirectoryInDirectoryOffset
                 _bw.Write(-1); // NextDirectoryInDirectoryOffset
                 _bw.Write(0); // Size
                 _bw.Write(-1); // FirstDirectoryOffset
@@ -119,96 +98,144 @@ namespace File_System
             _fs.Dispose();
             _fs = null;
         }
-        public void AddFile(MyFile newFile)
+        public void AddFileBlock(byte[] content)
         {
-            // | NextContainerOffset (4B) | IsDeleted (1B) | ParentDirectoryOffset |
-            // | NextFileInDirectoryOffset (4B) | BlocksCount (4B) | Name | Data - Blocks Content |
+            _fs.Position = _fs.Length;
+            _bw.Write(GetCRC(content));
+            _bw.Write(content);
+        }
+        public void AddFile(string originalFilePath, string newFileName)
+        {
+            // | ParentDirectoryOffset (4B) | PreviousFileInDirectoryOffset (4B) | NextFileInDirectoryOffset (4B) |
+            // | BlocksCount (4B) | Data - Blocks Content | Name |
 
-            FileNode newNode = new FileNode();
-            newNode.Value = newFile;
-            int newNodeOffset = (int)_fs.Length;
-            int currentOffset = FirstOffset;
-            while (currentOffset != -1)
+            if (!File.Exists(originalFilePath))
             {
-                _fs.Position = currentOffset;
-                currentOffset = _br.ReadInt32();
+                throw new FileNotFoundException();
             }
-            _fs.Position -= sizeof(int);
-            _bw.Write(newNodeOffset);
-            _fs.Position = newNodeOffset;
-            _bw.Write(-1); // NextContainerOffset
-            _bw.Write(false); // IsDeleted
+            int newFileOffset = (int)_fs.Length;
+            int lastFileInDirectoryOffset = GetLastElementInDirectoryOffset(ContainerElementTypeEnum.File);
+            _fs.Position = newFileOffset;
             _bw.Write(CurrentDirectoryOffset); // ParentDirectoryOffset
+            _bw.Write(lastFileInDirectoryOffset); // PreviousFileInDirectoryOffset
             _bw.Write(-1); // NextFileInDirectoryOffset
-            _bw.Write(newFile.BlocksCount); // BlocksCount
-            _bw.Write(newFile.Name); // Name
-            BlockNode currentBlock = newFile.FileBlocks.FirstBlockNode;
-            while (currentBlock != null)
+            _bw.Write(0); // BlocksCount
+            int blocks_count = 0;
+            FileStream fs = new FileStream(originalFilePath, FileMode.Open, FileAccess.Read);
+            BinaryReader br = new BinaryReader(fs);
+            byte[] blockContent;
+            while (fs.Position < fs.Length)
             {
-                _bw.Write(currentBlock.Content);  // BlocksContent
-                currentBlock = currentBlock.Next;
+                blockContent = new byte[FILE_BLOCK_SIZE];
+                br.Read(blockContent, 0, FILE_BLOCK_SIZE);
+                AddFileBlock(blockContent);
+                blocks_count++;
             }
-            int lastFileInDirectory = GetLastElementInDirectoryOffset('f');
-            if (lastFileInDirectory != -1)
+            br.Close();
+            fs.Close();
+            _bw.Write(newFileName); // Name
+            _fs.Position = newFileOffset + 3 * sizeof(int);
+            _bw.Write(blocks_count); // BlocksCount update
+
+            if (lastFileInDirectoryOffset != -1)
             {
-                _fs.Position = lastFileInDirectory + sizeof(bool) + sizeof(int) * 2;
-                _bw.Write(newNodeOffset); // NextFileInDirectoryOffset for the parent directory  
+                _fs.Position = lastFileInDirectoryOffset + 2 * sizeof(int);
+                _bw.Write(newFileOffset); // NextFileInDirectoryOffset for the parent directory
             }
             else
             {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 5;
-                _bw.Write(newNodeOffset); // FirstFileOffset for the parent directory
+                _fs.Position = CurrentDirectoryOffset + 5 * sizeof(int);
+                _bw.Write(newFileOffset); // FirstFileOffset for the parent directory
             }
             int parentDirectoryOffset = CurrentDirectoryOffset;
             while (parentDirectoryOffset != -1)
             {
-                UpdateDirectorySize(parentDirectoryOffset, newFile.BlocksCount * FILE_BLOCK_SIZE);
-                _fs.Position = parentDirectoryOffset + sizeof(bool) + sizeof(int);
-                parentDirectoryOffset = _br.ReadInt32();
+                UpdateDirectorySize(parentDirectoryOffset, blocks_count * FILE_BLOCK_SIZE);
+                _fs.Position = parentDirectoryOffset;
+                parentDirectoryOffset = _br.ReadInt32(); // ParentDirectoryOffset
             }
             _fs.Flush();
         }
         public DirectoryNode GetDirectoryNode(int nodeOffset)
         {
             DirectoryNode result = new DirectoryNode();
-            _fs.Position = nodeOffset + sizeof(int);
-            result.IsDeleted = _br.ReadBoolean();
-            _fs.Position += sizeof(int);
-            result.NextOffset = _br.ReadInt32(); // NextDirectoryInDirectoryOffset
+            result.Offset = nodeOffset;
+            _fs.Position = nodeOffset;
+            result.ParentDirectoryOffset = _br.ReadInt32();
+            result.PreviousDirectoryInDirectoryOffset = _br.ReadInt32();
+            result.NextDirectoryInDirectoryOffset = _br.ReadInt32();
             result.Size = _br.ReadInt32();
-            _fs.Position += 2 * sizeof(int);
+            result.FirstDirectoryOffset = _br.ReadInt32();
+            result.FirstFileOffset = _br.ReadInt32();
             result.Name = _br.ReadString();
             return result;
         }
         public FileNode GetFileNode(int nodeOffset)
         {
             FileNode result = new FileNode();
-            _fs.Position = nodeOffset + sizeof(int);
-            result.IsDeleted = _br.ReadBoolean();
-            _fs.Position += sizeof(int);
-            result.NextOffset = _br.ReadInt32(); // NextFileInDirectoryOffset
-            result.Value = new MyFile();
-            result.Value.BlocksCount = _br.ReadInt32();
-            result.Value.Name = _br.ReadString();
-            result.Value.FileBlocks = new FileBocksLinkedList();
-            for (int i = 0; i < result.Value.BlocksCount; i++)
+            result.Offset = nodeOffset;
+            _fs.Position = nodeOffset;
+            result.ParentDirectoryOffset = _br.ReadInt32();
+            result.PreviousFileInDirectoryOffset = _br.ReadInt32();
+            result.NextFileInDirectoryOffset = _br.ReadInt32();
+            result.BlocksCount = _br.ReadInt32();
+            _fs.Position += result.BlocksCount * (sizeof(int) + FILE_BLOCK_SIZE);
+            result.Name = _br.ReadString();
+            return result;
+        }
+        public byte[] GetValidatedFileBlock(int offset)
+        {
+            byte[] result = GetFileBlock(offset);
+            if (GetBlockCRC(offset) != GetCRC(result))
             {
-                result.Value.FileBlocks.Append(_br.ReadBytes(FILE_BLOCK_SIZE));
+                throw new FileLoadException();
             }
             return result;
         }
-        public void RemoveFileNode(int nodeOffset)
+        public int GetBlockCRC(int offset)
         {
-            _fs.Position = nodeOffset + sizeof(int);
-            _bw.Write(true); // IsDeleted
-            int parentDirectoryOffset = _br.ReadInt32();
-            _fs.Position += sizeof(int); // NextFileInDirectoryOffset
-            int blocksCount = _br.ReadInt32();
+            _fs.Position = offset;
+            return _br.ReadInt32();
+        }
+        public byte[] GetFileBlock(int offset)
+        {
+            byte[] result = new byte[FILE_BLOCK_SIZE];
+            _fs.Position = offset + sizeof(int);
+            _br.Read(result, 0, result.Length);
+            return result;
+        }
+        
+        // For testing purposes
+        public void CorruptFileBlock(int offset)
+        {
+            byte[] newBlock = new byte[FILE_BLOCK_SIZE];
+            _fs.Position = offset + sizeof(int);
+            _bw.Write(newBlock);
+        }
+        public void RemoveFileNode(FileNode fileNode)
+        {
+            if (fileNode.PreviousFileInDirectoryOffset != -1)
+            {
+                _fs.Position = fileNode.PreviousFileInDirectoryOffset + 2 * sizeof(int);
+                _bw.Write(fileNode.NextFileInDirectoryOffset); // NextFileInDirectoryOffset
+            }
+            else
+            {
+                _fs.Position = fileNode.ParentDirectoryOffset + 5 * sizeof(int);
+                _bw.Write(fileNode.NextFileInDirectoryOffset); // FirstFileOffset
+            }
+            if (fileNode.NextFileInDirectoryOffset != -1)
+            {
+                _fs.Position = fileNode.NextFileInDirectoryOffset + sizeof(int);
+                _bw.Write(fileNode.PreviousFileInDirectoryOffset); // PreviousFileInDirectoryOffset
+            }
+
+            int parentDirectoryOffset = fileNode.ParentDirectoryOffset;
             while (parentDirectoryOffset != -1)
             {
-                UpdateDirectorySize(parentDirectoryOffset, -blocksCount * FILE_BLOCK_SIZE);
-                _fs.Position = parentDirectoryOffset + sizeof(bool) + sizeof(int);
-                parentDirectoryOffset = _br.ReadInt32();
+                UpdateDirectorySize(parentDirectoryOffset, -fileNode.BlocksCount * FILE_BLOCK_SIZE);
+                _fs.Position = parentDirectoryOffset;
+                parentDirectoryOffset = _br.ReadInt32(); // ParentDirectoryOffset
             }
             DeletesCount++;
             if (DeletesCount == DELETES_COUNT_FOR_DEFRAGMENTATION)
@@ -221,71 +248,50 @@ namespace File_System
         }
         public void MakeDirectory(string newDirectoryName)
         {
-            // | NextContainerOffset (4B) | IsDeleted (1B) | ParentDirectoryOffset (4B) |
-            // | NextDirectoryInDirectoryOffset (4B) | Size (4B) | FirstDirectoryOffset (4B) | FirstFileOffset (4B) | Name |
-
             int newDirectoryOffset = (int)_fs.Length;
-            int currentOffset = FirstOffset;
-            while (currentOffset != -1)
-            {
-                _fs.Position = currentOffset;
-                currentOffset = _br.ReadInt32();
-            }
-            _fs.Position -= sizeof(int);
-            _bw.Write(newDirectoryOffset);
-
+            int lastDirectoryInDirectoryOffset = GetLastElementInDirectoryOffset(ContainerElementTypeEnum.Folder);
             _fs.Position = newDirectoryOffset;
-            _bw.Write(-1); // NextContainerOffset
-            _bw.Write(false); // IsDeleted
             _bw.Write(CurrentDirectoryOffset); // ParentDirectoryOffset
+            _bw.Write(lastDirectoryInDirectoryOffset); // PreviousDirectoryInDirectoryOffset
             _bw.Write(-1); // NextDirectoryInDirectoryOffset
             _bw.Write(0); // Size
             _bw.Write(-1); // FirstDirectoryOffset
             _bw.Write(-1); // FirstFileOffset
             _bw.Write(newDirectoryName); // Name
 
-            int lastDirectory = GetLastElementInDirectoryOffset('d');
-            if (lastDirectory != -1)
+            if (lastDirectoryInDirectoryOffset != -1)
             {
-                _fs.Position = lastDirectory + sizeof(bool) + sizeof(int) * 2;
+                _fs.Position = lastDirectoryInDirectoryOffset + 2 * sizeof(int);
                 _bw.Write(newDirectoryOffset); // NextDirectoryInDirectoryOffset for the parent directory
             }
             else
             {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 4;
+                _fs.Position = CurrentDirectoryOffset + 4 * sizeof(int);
                 _bw.Write(newDirectoryOffset); // FirstDirectoryOffset for the parent directory
             }
 
             _fs.Flush();
         }
-        public int GetFirstElementInDirectoryOffset(char t) // type: d - directory, f - file
+        public int GetFirstElementInDirectoryOffset(ContainerElementTypeEnum cet)
         {
-            if (t == 'd')
+            if (cet == ContainerElementTypeEnum.Folder)
             {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 4;
+                _fs.Position = CurrentDirectoryOffset + 4 * sizeof(int);
             }
             else
             {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 5;
+                _fs.Position = CurrentDirectoryOffset + 5 * sizeof(int);
             }
             return _br.ReadInt32();
         }
-        public int GetLastElementInDirectoryOffset(char t)
+        public int GetLastElementInDirectoryOffset(ContainerElementTypeEnum cet)
         {
-            if (t == 'd')
-            {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 4;
-            }
-            else
-            {
-                _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int) * 5;
-            }
-            int currentElementOffset = _br.ReadInt32(); // firstElementOffset
+            int currentElementOffset = GetFirstElementInDirectoryOffset(cet);
             int lastElementOffset = currentElementOffset;
             while (currentElementOffset != -1)
             {
                 lastElementOffset = currentElementOffset;
-                _fs.Position = currentElementOffset + sizeof(bool) + sizeof(int) * 2;
+                _fs.Position = currentElementOffset + 2 * sizeof(int);
                 currentElementOffset = _br.ReadInt32();
             }
             return lastElementOffset;
@@ -305,24 +311,24 @@ namespace File_System
                         // parent directory
                         if (CurrentDirectoryOffset != sizeof(int))
                         {
-                            _fs.Position = CurrentDirectoryOffset + sizeof(bool) + sizeof(int);
+                            _fs.Position = CurrentDirectoryOffset;
                             CurrentDirectoryOffset = _br.ReadInt32();
                         }
                         break;
                     }
                 default:
                     {
-                        int currentOffset = GetFirstElementInDirectoryOffset('d');
+                        int currentOffset = GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.Folder);
                         DirectoryNode current;
                         while (currentOffset != -1)
                         {
                             current = GetDirectoryNode(currentOffset);
-                            if (!current.IsDeleted && current.Name == directoryName)
+                            if (current.Name == directoryName)
                             {
                                 CurrentDirectoryOffset = currentOffset;
                                 break;
                             }
-                            currentOffset = current.NextOffset;
+                            currentOffset = current.NextDirectoryInDirectoryOffset;
                         }
                         if (currentOffset == -1)
                         {
@@ -333,17 +339,28 @@ namespace File_System
             }
 
         }
-        public void RemoveDirectory(int directoryOffset)
+        public void RemoveDirectory(DirectoryNode directoryNode)
         {
-            _fs.Position = directoryOffset + sizeof(int);
-            _bw.Write(true); // IsDeleted
-            int parentDirectoryOffset = _br.ReadInt32();
-            _fs.Position += sizeof(int); // NextDirectoryInDirectoryOffset
-            int size = _br.ReadInt32();
+            if (directoryNode.PreviousDirectoryInDirectoryOffset != -1)
+            {
+                _fs.Position = directoryNode.PreviousDirectoryInDirectoryOffset + 2 * sizeof(int);
+                _bw.Write(directoryNode.NextDirectoryInDirectoryOffset); // NextDirectoryInDirectoryOffset
+            }
+            else
+            {
+                _fs.Position = directoryNode.ParentDirectoryOffset + 4 * sizeof(int);
+                _bw.Write(directoryNode.NextDirectoryInDirectoryOffset); // FirstDirectoryOffset
+            }
+            if (directoryNode.NextDirectoryInDirectoryOffset != -1)
+            {
+                _fs.Position = directoryNode.NextDirectoryInDirectoryOffset + sizeof(int);
+                _bw.Write(directoryNode.PreviousDirectoryInDirectoryOffset); // PreviousDirectoryInDirectoryOffset
+            }
+            int parentDirectoryOffset = directoryNode.ParentDirectoryOffset;
             while (parentDirectoryOffset != -1)
             {
-                UpdateDirectorySize(parentDirectoryOffset, -size);
-                _fs.Position = parentDirectoryOffset + sizeof(bool) + sizeof(int);
+                UpdateDirectorySize(parentDirectoryOffset, -directoryNode.Size);
+                _fs.Position = parentDirectoryOffset;
                 parentDirectoryOffset = _br.ReadInt32();
             }
             DeletesCount++;
@@ -357,7 +374,7 @@ namespace File_System
         }
         public void UpdateDirectorySize(int directoryOffset, int deltaSize)
         {
-            _fs.Position = directoryOffset + sizeof(bool) + sizeof(int) * 3;
+            _fs.Position = directoryOffset + 3 * sizeof(int);
             int previousSize = _br.ReadInt32();
             _fs.Position -= sizeof(int);
             _bw.Write(previousSize + deltaSize);
@@ -370,8 +387,7 @@ namespace File_System
             tempFS = new FileStream(tempPath, FileMode.Create, FileAccess.ReadWrite);
             tempBW = new BinaryWriter(tempFS);
             tempBR = new BinaryReader(tempFS);
-            _fs.Position = 0;
-            tempBW.Write(_br.ReadInt32()); // DeletesCount
+            tempBW.Write(0); // DeletesCount
             AddDefragmentedDirectory(FirstOffset, -1);
             _fs.Dispose();
             tempFS.Dispose();
@@ -386,6 +402,7 @@ namespace File_System
         public void AddDefragmentedDirectory(int oldDirectoryOffset, int newParentDirectoryOffset)
         {
             // add the directory info and update current data in the new container file
+
             DirectoryNode oldDirectory = GetDirectoryNode(oldDirectoryOffset);
             int newDirectoryOffset = (int)tempFS.Length;
             if (OldCurrentDirectoryOffset == oldDirectoryOffset)
@@ -393,9 +410,10 @@ namespace File_System
                 NewCurrentDirectoryOffset = newDirectoryOffset;
             }
             int currentOffset;
+            int lastOffset = -1;
             if (newParentDirectoryOffset != -1)
             {
-                tempFS.Position = newParentDirectoryOffset + 4 * sizeof(int) + sizeof(bool);
+                tempFS.Position = newParentDirectoryOffset + 4 * sizeof(int);
                 int firstDirectoryInDirectory = tempBR.ReadInt32();
                 if (firstDirectoryInDirectory == -1)
                 {
@@ -407,89 +425,118 @@ namespace File_System
                     currentOffset = firstDirectoryInDirectory;
                     while (currentOffset != -1)
                     {
-                        tempFS.Position = currentOffset + 2 * sizeof(int) + sizeof(bool);
+                        lastOffset = currentOffset;
+                        tempFS.Position = currentOffset + 2 * sizeof(int);
                         currentOffset = tempBR.ReadInt32(); // NextDirectoryInDirectoryOffset
                     }
                     tempFS.Position -= sizeof(int);
                     tempBW.Write(newDirectoryOffset);
                 }
-                currentOffset = FirstOffset;
-                while (currentOffset != -1)
-                {
-                    tempFS.Position = currentOffset;
-                    currentOffset = tempBR.ReadInt32();
-                }
-                tempFS.Position -= sizeof(int);
-                tempBW.Write(newDirectoryOffset);
             }
             tempFS.Position = newDirectoryOffset;
-            tempBW.Write(-1);
-            tempBW.Write(false);
             tempBW.Write(newParentDirectoryOffset);
-            tempBW.Write(-1);
+            tempBW.Write(lastOffset); // PreviousDirectoryInDirectoryOffset
+            tempBW.Write(-1); // NextDirectoryInDirectoryOffset
             tempBW.Write(oldDirectory.Size);
-            tempBW.Write(-1);
-            tempBW.Write(-1);
+            tempBW.Write(-1); // FirstDirectoryOffset
+            tempBW.Write(-1); // FirstFileOffset
             tempBW.Write(oldDirectory.Name);
 
-            int newLastElementOffset = newDirectoryOffset;
+            int lastFileOffset = -1;
+            int newFileOffset;
             int newFirstFileOffset = -1;
             CurrentDirectoryOffset = oldDirectoryOffset;
 
             // add the files from the directory
-            int currentFileOffset = GetFirstElementInDirectoryOffset('f');
+            int currentFileOffset = GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.File);
             FileNode currentFile;
             while (currentFileOffset != -1)
             {
                 currentFile = GetFileNode(currentFileOffset);
-                if (!currentFile.IsDeleted) // the file is not deleted
+                newFileOffset = (int)tempFS.Length;
+                if (newFirstFileOffset == -1)
                 {
-                    if (newFirstFileOffset == -1)
-                    {
-                        newFirstFileOffset = (int)tempFS.Length;
-                    }
-                    else
-                    {
-                        // The last element in the new container file is a file from the directory we are adding.
-                        tempFS.Position = newLastElementOffset + 2 * sizeof(int) + sizeof(bool);
-                        tempBW.Write((int)tempFS.Length); // NextFileInDirectoryOffset
-                    }
-                    tempFS.Position = newLastElementOffset;
-                    newLastElementOffset = (int)tempFS.Length;
-                    tempBW.Write(newLastElementOffset);// NextContainerOffset
-                    tempFS.Position = newLastElementOffset;
-                    tempBW.Write(-1); // NextContainerOffset
-                    tempBW.Write(false); // IsDeleted
-                    tempBW.Write(newDirectoryOffset); // ParentDirectoryOffset
-                    tempBW.Write(-1); // NextFileInDirectoryOffset
-                    tempBW.Write(currentFile.Value.BlocksCount); // BlocksCount
-                    tempBW.Write(currentFile.Value.Name); // Name
-                    BlockNode currentBlock = currentFile.Value.FileBlocks.FirstBlockNode;
-                    while (currentBlock != null)
-                    {
-                        tempBW.Write(currentBlock.Content);  // BlocksContent
-                        currentBlock = currentBlock.Next;
-                    }
+                    newFirstFileOffset = newFileOffset;
                 }
-                currentFileOffset = currentFile.NextOffset;
+                else
+                {
+                    // The last element in the new container file is a file from the directory we are adding.
+                    tempFS.Position = lastFileOffset + 2 * sizeof(int);
+                    tempBW.Write(newFileOffset); // NextFileInDirectoryOffset
+                }
+                tempFS.Position = newFileOffset;
+                tempBW.Write(newDirectoryOffset); // ParentDirectoryOffset
+                tempBW.Write(lastFileOffset); // PreviousFileInDirectoryOffset
+                tempBW.Write(-1); // NextFileInDirectoryOffset
+                tempBW.Write(currentFile.BlocksCount); // BlocksCount
+                int blockOffset;
+                for (int i = 0; i < currentFile.BlocksCount; i++)
+                {
+                    blockOffset = currentFileOffset + 4 * sizeof(int) + i * (sizeof(int) + FILE_BLOCK_SIZE);
+                    tempBW.Write(GetBlockCRC(blockOffset));
+                    tempBW.Write(GetFileBlock(blockOffset));
+                }
+                tempBW.Write(currentFile.Name); // Name
+
+                currentFileOffset = currentFile.NextFileInDirectoryOffset;
+                lastFileOffset = newFileOffset;
             }
-            tempFS.Position = newDirectoryOffset + 5 * sizeof(int) + sizeof(bool);
+            tempFS.Position = newDirectoryOffset + 5 * sizeof(int);
             tempBW.Write(newFirstFileOffset);
 
             // add the directories from the directory
-            int currentDirectoryOffset = GetFirstElementInDirectoryOffset('d');
+            int currentDirectoryOffset = GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.Folder);
             DirectoryNode currentDirectory;
             while (currentDirectoryOffset != -1)
             {
                 currentDirectory = GetDirectoryNode(currentDirectoryOffset);
-                if (!currentDirectory.IsDeleted) // the directory is not deleted
-                {
-                    AddDefragmentedDirectory(currentDirectoryOffset, newDirectoryOffset);
-                }
-                currentDirectoryOffset = currentDirectory.NextOffset;
+                AddDefragmentedDirectory(currentDirectoryOffset, newDirectoryOffset);
+                currentDirectoryOffset = currentDirectory.NextDirectoryInDirectoryOffset;
             }
         }
+        public int GetCRC(byte[] data)
+        {
+            int dataLength = data.Length * 8;
+            int divisorLength = GetBitLength(CRC_DIVISOR);
+            int totalLength = dataLength + divisorLength - 1;
+
+            int[] tempData = new int[totalLength];
+            for (int i = 0; i < data.Length; i++)
+            {
+                for (int bit = 0; bit < 8; bit++)
+                {
+                    tempData[i * 8 + bit] = (data[i] >> (7 - bit)) & 1;
+                }
+            }
+            for (int i = 0; i < dataLength; i++)
+            {
+                if (tempData[i] == 1)
+                {
+                    for (int j = 0; j < divisorLength; j++)
+                    {
+                        tempData[i + j] ^= (int)((CRC_DIVISOR >> (divisorLength - 1 - j)) & 1);
+                    }
+                }
+            }
+            int remainder = 0;
+            for (int i = 0; i < divisorLength - 1; i++)
+            {
+                remainder |= (int)(tempData[dataLength + i] << ((divisorLength - 2) - i));
+            }
+            return remainder;
+        }
+        static int GetBitLength(uint value)
+        {
+            int length = 0;
+            while (value > 0)
+            {
+                length++;
+                value >>= 1;
+            }
+            return length;
+        }
     }
+
     internal class Program
     {
         static void Main(string[] args)
@@ -505,12 +552,10 @@ namespace File_System
                 string[] inputs = Split(Console.ReadLine());
                 if (inputs.Length == 0)
                 {
-                    Console.WriteLine($"Please add a command.");
+                    Console.WriteLine($"Please enter a valid command.");
                 }
                 else
                 {
-
-
                     string command = inputs[0];
                     switch (command)
                     {
@@ -523,29 +568,14 @@ namespace File_System
                             }
                             string originalFilePath = inputs[1];
                             string newFileName = inputs[2];
-                            if (!File.Exists(originalFilePath))
+                            try
                             {
-                                throw new FileNotFoundException();
+                                fileSystem.AddFile(originalFilePath, newFileName);
                             }
-                            FileBocksLinkedList fileBocks = new FileBocksLinkedList();
-                            int blocks_count = 0;
-                            FileStream fs = new FileStream(originalFilePath, FileMode.Open, FileAccess.Read);
-                            BinaryReader br = new BinaryReader(fs);
-                            byte[] blockContent;
-                            while (fs.Position < fs.Length)
+                            catch (FileNotFoundException)
                             {
-                                blockContent = new byte[FileStreamFileSystem.FILE_BLOCK_SIZE];
-                                br.Read(blockContent, 0, FileStreamFileSystem.FILE_BLOCK_SIZE);
-                                fileBocks.Append(blockContent);
-                                blocks_count++;
+                                Console.WriteLine($"Please provide an existing file.");
                             }
-                            br.Close();
-                            fs.Close();
-                            MyFile newFile = new MyFile();
-                            newFile.Name = newFileName;
-                            newFile.FileBlocks = fileBocks;
-                            newFile.BlocksCount = blocks_count;
-                            fileSystem.AddFile(newFile);
                             Console.ReadLine();
                             break;
 
@@ -558,28 +588,22 @@ namespace File_System
                                     break;
                                 }
                                 Console.WriteLine("Files:");
-                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset('f');
-                                FileNode current = null;
+                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.File);
+                                FileNode current;
                                 while (currentOffset != -1)
                                 {
                                     current = fileSystem.GetFileNode(currentOffset);
-                                    if (!current.IsDeleted)
-                                    {
-                                        Console.WriteLine($"{current.Value.Name}    {current.Value.BlocksCount * FileStreamFileSystem.FILE_BLOCK_SIZE}B");
-                                    }
-                                    currentOffset = current.NextOffset;
+                                    Console.WriteLine($"{current.Name}    {current.BlocksCount * FileStreamFileSystem.FILE_BLOCK_SIZE}B");
+                                    currentOffset = current.NextFileInDirectoryOffset;
                                 }
                                 Console.WriteLine("Folders:");
-                                currentOffset = fileSystem.GetFirstElementInDirectoryOffset('d');
-                                DirectoryNode directory = null;
+                                currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.Folder);
+                                DirectoryNode directory;
                                 while (currentOffset != -1)
                                 {
                                     directory = fileSystem.GetDirectoryNode(currentOffset);
-                                    if (!directory.IsDeleted)
-                                    {
-                                        Console.WriteLine($"{directory.Name}    {directory.Size}B");
-                                    }
-                                    currentOffset = directory.NextOffset;
+                                    Console.WriteLine($"{directory.Name}    {directory.Size}B");
+                                    currentOffset = directory.NextDirectoryInDirectoryOffset;
                                 }
                                 Console.ReadLine();
                             }
@@ -594,18 +618,18 @@ namespace File_System
                                     break;
                                 }
                                 string fileToDelete = inputs[1];
-                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset('f');
-                                FileNode current = null;
+                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.File);
+                                FileNode current;
                                 while (currentOffset != -1)
                                 {
                                     current = fileSystem.GetFileNode(currentOffset);
-                                    if (!current.IsDeleted && current.Value.Name == fileToDelete)
+                                    if (current.Name == fileToDelete)
                                     {
-                                        fileSystem.RemoveFileNode(currentOffset);
+                                        fileSystem.RemoveFileNode(current);
                                         Console.WriteLine("Successful removal.");
                                         break;
                                     }
-                                    currentOffset = current.NextOffset;
+                                    currentOffset = current.NextFileInDirectoryOffset;
                                 }
                                 if (currentOffset == -1)
                                 {
@@ -624,24 +648,37 @@ namespace File_System
                                 }
                                 string fileToCopy = inputs[1];
                                 string newFilePath = inputs[2];
-                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset('f');
+                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.File);
                                 FileNode current;
-                                fs = new FileStream(newFilePath, FileMode.Create, FileAccess.Write);
+                                FileStream fs = new FileStream(newFilePath, FileMode.Create, FileAccess.Write);
                                 while (currentOffset != -1)
                                 {
                                     current = fileSystem.GetFileNode(currentOffset);
-                                    if (!current.IsDeleted && current.Value.Name == fileToCopy)
+                                    if (current.Name == fileToCopy)
                                     {
-                                        BlockNode block = current.Value.FileBlocks.FirstBlockNode;
-                                        while (block != null)
+                                        try
                                         {
-                                            fs.Write(block.Content);
-                                            block = block.Next;
+                                            byte[] block;
+                                            int blockOffset;
+                                            for (int i = 0; i < current.BlocksCount; i++)
+                                            {
+                                                blockOffset = currentOffset + 4 * sizeof(int) + i * (sizeof(int) + FileStreamFileSystem.FILE_BLOCK_SIZE);
+                                                block = fileSystem.GetValidatedFileBlock(blockOffset);
+                                                fs.Write(block);
+                                            }
+                                            Console.WriteLine("File copied successfully.");
+                                            fs.Dispose();
+                                            break;
                                         }
-                                        Console.WriteLine("File copied successfully.");
-                                        break;
+                                        catch (FileLoadException)
+                                        {
+                                            Console.WriteLine("The file is corrupted and can't be used anymore. Please remove it from the container.");
+                                            fs.Dispose();
+                                            File.Delete(newFilePath);
+                                            break;
+                                        }
                                     }
-                                    currentOffset = current.NextOffset;
+                                    currentOffset = current.NextFileInDirectoryOffset;
                                 }
                                 fs.Close();
                                 if (currentOffset == -1)
@@ -682,17 +719,17 @@ namespace File_System
                                     break;
                                 }
                                 directoryName = inputs[1];
-                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset('d');
+                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.Folder);
                                 DirectoryNode current;
                                 while (currentOffset != -1)
                                 {
                                     current = fileSystem.GetDirectoryNode(currentOffset);
-                                    if (!current.IsDeleted && current.Name == directoryName)
+                                    if (current.Name == directoryName)
                                     {
-                                        fileSystem.RemoveDirectory(currentOffset);
+                                        fileSystem.RemoveDirectory(current);
                                         break;
                                     }
-                                    currentOffset = current.NextOffset;
+                                    currentOffset = current.NextDirectoryInDirectoryOffset;
                                 }
                                 if (currentOffset == -1)
                                 {
@@ -702,18 +739,42 @@ namespace File_System
                                 break;
                             }
                         case "h":
-                            Console.WriteLine("cpin c:\\aaa.txt bbb.txt - copy the file aaa.txt to the container with the name bbb.txt");
-                            Console.WriteLine("ls - list all files in the current directory of the container.");
-                            Console.WriteLine("rm bbb.txt - remove the file bbb.txt from the current directory of the container.");
-                            Console.WriteLine("cpout bbb.txt c:\\ttt.txt  - copy the file bbb.txt from the current directory of the container to the specified path c:\\ttt.txt.");
-                            Console.WriteLine("md FolderAAA - make new directory named FolderAAA in the current directory of the container.");
-                            Console.WriteLine("cd FolderAAA - change the current directory of the container to its child directory FolderAAA.");
-                            Console.WriteLine("cd .. - change the current directory of the container to its parent one.");
-                            Console.WriteLine("cd \\ - change the current directory of the container to the main one.");
-                            Console.WriteLine("rd FolderAAA - remove the directory named FolderAAA from the current directory of the container.");
-                            Console.WriteLine("q - quit.");
-                            Console.ReadLine();
-                            break;
+                            {
+                                Console.WriteLine("cpin c:\\aaa.txt bbb.txt - copy the file aaa.txt to the container with the name bbb.txt");
+                                Console.WriteLine("ls - list all files in the current directory of the container.");
+                                Console.WriteLine("rm bbb.txt - remove the file bbb.txt from the current directory of the container.");
+                                Console.WriteLine("cpout bbb.txt c:\\ttt.txt  - copy the file bbb.txt from the current directory of the container to the specified path c:\\ttt.txt.");
+                                Console.WriteLine("md FolderAAA - make new directory named FolderAAA in the current directory of the container.");
+                                Console.WriteLine("cd FolderAAA - change the current directory of the container to its child directory FolderAAA.");
+                                Console.WriteLine("cd .. - change the current directory of the container to its parent one.");
+                                Console.WriteLine("cd \\ - change the current directory of the container to the main one.");
+                                Console.WriteLine("rd FolderAAA - remove the directory named FolderAAA from the current directory of the container.");
+                                Console.WriteLine("q - quit.");
+                                Console.ReadLine();
+                                break;
+                            }
+                        // For testing
+                        case "corrupt":
+                            {
+                                if (inputs.Length != 2)
+                                {
+                                    break;
+                                }
+                                string fileName = inputs[1];
+                                int currentOffset = fileSystem.GetFirstElementInDirectoryOffset(ContainerElementTypeEnum.File);
+                                FileNode current;
+                                while (currentOffset != -1)
+                                {
+                                    current = fileSystem.GetFileNode(currentOffset);
+                                    if (current.Name == fileName)
+                                    {
+                                        fileSystem.CorruptFileBlock(currentOffset + 4 * sizeof(int));
+                                        break;
+                                    }
+                                    currentOffset = current.NextFileInDirectoryOffset;
+                                }
+                                break;
+                            }
                         case "q":
                             fileSystem.Dispose();
                             return;
@@ -785,4 +846,3 @@ namespace File_System
         }
     }
 }
-
