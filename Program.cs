@@ -123,11 +123,15 @@ namespace File_System
             int blocks_count = 0;
             FileStream fs = new FileStream(originalFilePath, FileMode.Open, FileAccess.Read);
             BinaryReader br = new BinaryReader(fs);
-            byte[] blockContent;
+            byte[] blockContent = new byte[FILE_BLOCK_SIZE];
+            int bytesRead;
             while (fs.Position < fs.Length)
             {
-                blockContent = new byte[FILE_BLOCK_SIZE];
-                br.Read(blockContent, 0, FILE_BLOCK_SIZE);
+                bytesRead = br.Read(blockContent, 0, FILE_BLOCK_SIZE);
+                if (bytesRead < FILE_BLOCK_SIZE)
+                {
+                    Array.Clear(blockContent, bytesRead, FILE_BLOCK_SIZE - bytesRead);
+                }
                 AddFileBlock(blockContent);
                 blocks_count++;
             }
