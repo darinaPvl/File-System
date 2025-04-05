@@ -1,7 +1,9 @@
 ﻿
+using System.Collections.Generic;
+using File_System.Compressor;
+
 namespace File_System
 {
-
     public enum ContainerElementTypeEnum
     {
         File,
@@ -26,6 +28,7 @@ namespace File_System
         public int ParentDirectoryOffset;
         public int PreviousFileInDirectoryOffset;
         public int NextFileInDirectoryOffset;
+        public int PositionsForFileContent;
     }
     class FileStreamFileSystem
     {
@@ -36,7 +39,7 @@ namespace File_System
         //      | FirstDirectoryOffset (4B) | FirstFileOffset (4B) | Name | 
         // if file:
         //      | PreviousFileInDirectoryOffset (4B) | NextFileInDirectoryOffset (4B) | BlocksCount (4B) |
-        //      | Data - Blocks Content | Name | 
+        //      | PositionsForFileContent (4B) | Data - Blocks Content | Name | 
 
         public const int FILE_BLOCK_SIZE = 1024; // 1KB
         public const int DELETES_COUNT_FOR_DEFRAGMENTATION = 5;
@@ -49,6 +52,8 @@ namespace File_System
         private BinaryReader _br;
         private BinaryWriter _bw;
         private string _containerPath;
+        private HuffmanCompressor _compressor;
+
         FileStream tempFS;
         BinaryWriter tempBW;
         BinaryReader tempBR;
@@ -63,6 +68,8 @@ namespace File_System
             _fs = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite);
             _br = new BinaryReader(_fs);
             _bw = new BinaryWriter(_fs);
+            _compressor = new HuffmanCompressor();
+
             if (_fs.Length == 0)
             {
                 DeletesCount = 0;
@@ -100,14 +107,24 @@ namespace File_System
         }
         public void AddFileBlock(byte[] content)
         {
+            // | CRC | content.Length | treeBytes.Length | treeBytes | encodedBytes.Length | encodedBytes |
             _fs.Position = _fs.Length;
             _bw.Write(GetCRC(content));
-            _bw.Write(content);
+            _bw.Write(content.Length);
+            HuffmanNode root = _compressor.BuildTree(content);
+            ByteStack bytes = new ByteStack();
+            _compressor.TreeToBytes(root, bytes);
+            byte[] treeBytes = bytes.ToByteArray();
+            _bw.Write(treeBytes.Length);
+            _bw.Write(treeBytes);
+            byte[] encodedBytes = _compressor.HuffmanEncode(root, content);
+            _bw.Write(encodedBytes.Length);
+            _bw.Write(encodedBytes);
         }
         public void AddFile(string originalFilePath, string newFileName)
         {
             // | ParentDirectoryOffset (4B) | PreviousFileInDirectoryOffset (4B) | NextFileInDirectoryOffset (4B) |
-            // | BlocksCount (4B) | Data - Blocks Content | Name |
+            // | BlocksCount (4B) | PositionsForFileContent (4B) | Data - Blocks Content | Name |
 
             if (!File.Exists(originalFilePath))
             {
@@ -119,8 +136,10 @@ namespace File_System
             _bw.Write(CurrentDirectoryOffset); // ParentDirectoryOffset
             _bw.Write(lastFileInDirectoryOffset); // PreviousFileInDirectoryOffset
             _bw.Write(-1); // NextFileInDirectoryOffset
-            _bw.Write(0); // BlocksCount
+            _bw.Write(0); // BlocksCount - will be updated
+            _bw.Write(0); // PositionsForFileContent - will be updated
             int blocks_count = 0;
+            int startPosition = (int)_fs.Position;
             FileStream fs = new FileStream(originalFilePath, FileMode.Open, FileAccess.Read);
             BinaryReader br = new BinaryReader(fs);
             byte[] blockContent = new byte[FILE_BLOCK_SIZE];
@@ -130,16 +149,21 @@ namespace File_System
                 bytesRead = br.Read(blockContent, 0, FILE_BLOCK_SIZE);
                 if (bytesRead < FILE_BLOCK_SIZE)
                 {
-                    Array.Clear(blockContent, bytesRead, FILE_BLOCK_SIZE - bytesRead);
+                    byte[] block = new byte[bytesRead];
+                    Array.Copy(blockContent, block, bytesRead);
+                    blockContent = block;
                 }
                 AddFileBlock(blockContent);
                 blocks_count++;
             }
             br.Close();
             fs.Close();
+            int positionsForFileContent = (int)_fs.Position - startPosition;
+
             _bw.Write(newFileName); // Name
             _fs.Position = newFileOffset + 3 * sizeof(int);
             _bw.Write(blocks_count); // BlocksCount update
+            _bw.Write(positionsForFileContent); // PositionsForFileContent update
 
             if (lastFileInDirectoryOffset != -1)
             {
@@ -183,38 +207,49 @@ namespace File_System
             result.PreviousFileInDirectoryOffset = _br.ReadInt32();
             result.NextFileInDirectoryOffset = _br.ReadInt32();
             result.BlocksCount = _br.ReadInt32();
-            _fs.Position += result.BlocksCount * (sizeof(int) + FILE_BLOCK_SIZE);
+            result.PositionsForFileContent = _br.ReadInt32();
+            _fs.Position += result.PositionsForFileContent;
             result.Name = _br.ReadString();
             return result;
         }
-        public byte[] GetValidatedFileBlock(int offset)
+        public (byte[], int) GetValidatedFileBlock(int offset)
         {
-            byte[] result = GetFileBlock(offset);
-            if (GetBlockCRC(offset) != GetCRC(result))
+            (byte[] fileBlock, int nextOffset) = GetFileBlock(offset);
+            if (GetBlockCRC(offset) != GetCRC(fileBlock))
             {
                 throw new FileLoadException();
             }
-            return result;
+            return (fileBlock, nextOffset);
         }
         public int GetBlockCRC(int offset)
         {
             _fs.Position = offset;
             return _br.ReadInt32();
         }
-        public byte[] GetFileBlock(int offset)
+        public (byte[], int) GetFileBlock(int offset)
         {
-            byte[] result = new byte[FILE_BLOCK_SIZE];
+            // Returns the fileBlockContent and the next block's start offset
             _fs.Position = offset + sizeof(int);
-            _br.Read(result, 0, result.Length);
-            return result;
+            int contentLength = _br.ReadInt32();
+            int treeBytesLength = _br.ReadInt32();
+            byte[] treeBytes = new byte[treeBytesLength];
+            _br.Read(treeBytes, 0, treeBytesLength);
+            HuffmanNode root = _compressor.BytesToTree(treeBytes);
+            ByteStack bytes = new ByteStack();
+            int encodedBytesLength = _br.ReadInt32();
+            byte[] encodedBytes = new byte[encodedBytesLength];
+            _br.Read(encodedBytes, 0, encodedBytesLength);
+            return (_compressor.HuffmanDecode(root, encodedBytes, contentLength), (int)_fs.Position);
         }
-        
+
         // For testing purposes
         public void CorruptFileBlock(int offset)
         {
-            byte[] newBlock = new byte[FILE_BLOCK_SIZE];
-            _fs.Position = offset + sizeof(int);
-            _bw.Write(newBlock);
+            _fs.Position = offset + 2 * sizeof(int);
+            int treeBytesLength = _br.ReadInt32();
+            _fs.Position += treeBytesLength;
+            int encodedBytesLength = _br.ReadInt32();
+            _bw.Write(new byte[encodedBytesLength]);
         }
         public void RemoveFileNode(FileNode fileNode)
         {
@@ -406,7 +441,6 @@ namespace File_System
         public void AddDefragmentedDirectory(int oldDirectoryOffset, int newParentDirectoryOffset)
         {
             // add the directory info and update current data in the new container file
-
             DirectoryNode oldDirectory = GetDirectoryNode(oldDirectoryOffset);
             int newDirectoryOffset = (int)tempFS.Length;
             if (OldCurrentDirectoryOffset == oldDirectoryOffset)
@@ -473,13 +507,8 @@ namespace File_System
                 tempBW.Write(lastFileOffset); // PreviousFileInDirectoryOffset
                 tempBW.Write(-1); // NextFileInDirectoryOffset
                 tempBW.Write(currentFile.BlocksCount); // BlocksCount
-                int blockOffset;
-                for (int i = 0; i < currentFile.BlocksCount; i++)
-                {
-                    blockOffset = currentFileOffset + 4 * sizeof(int) + i * (sizeof(int) + FILE_BLOCK_SIZE);
-                    tempBW.Write(GetBlockCRC(blockOffset));
-                    tempBW.Write(GetFileBlock(blockOffset));
-                }
+                tempBW.Write(currentFile.PositionsForFileContent); // PositionsForFileContent
+                tempBW.Write(GetBytesInInterval(currentFileOffset + 5 * sizeof(int), currentFile.PositionsForFileContent));
                 tempBW.Write(currentFile.Name); // Name
 
                 currentFileOffset = currentFile.NextFileInDirectoryOffset;
@@ -497,6 +526,13 @@ namespace File_System
                 AddDefragmentedDirectory(currentDirectoryOffset, newDirectoryOffset);
                 currentDirectoryOffset = currentDirectory.NextDirectoryInDirectoryOffset;
             }
+        }
+        public byte[] GetBytesInInterval(int fromOffset, int count)
+        {
+            byte[] bytes = new byte[count];
+            _fs.Position = fromOffset;
+            _br.Read(bytes, 0, bytes.Length);
+            return bytes;
         }
         public int GetCRC(byte[] data)
         {
@@ -663,11 +699,10 @@ namespace File_System
                                         try
                                         {
                                             byte[] block;
-                                            int blockOffset;
+                                            int blockOffset = currentOffset + 5 * sizeof(int);
                                             for (int i = 0; i < current.BlocksCount; i++)
                                             {
-                                                blockOffset = currentOffset + 4 * sizeof(int) + i * (sizeof(int) + FileStreamFileSystem.FILE_BLOCK_SIZE);
-                                                block = fileSystem.GetValidatedFileBlock(blockOffset);
+                                                (block, blockOffset) = fileSystem.GetValidatedFileBlock(blockOffset);
                                                 fs.Write(block);
                                             }
                                             Console.WriteLine("File copied successfully.");
@@ -772,7 +807,7 @@ namespace File_System
                                     current = fileSystem.GetFileNode(currentOffset);
                                     if (current.Name == fileName)
                                     {
-                                        fileSystem.CorruptFileBlock(currentOffset + 4 * sizeof(int));
+                                        fileSystem.CorruptFileBlock(currentOffset + 5 * sizeof(int));
                                         break;
                                     }
                                     currentOffset = current.NextFileInDirectoryOffset;
@@ -849,4 +884,4 @@ namespace File_System
             }
         }
     }
-}
+}  
